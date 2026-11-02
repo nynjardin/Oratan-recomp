@@ -51,6 +51,14 @@ class OratanApp : public rex::ReXApp {
     config_path_ = paths.config_path;
     // XBLA titles run as the trial unless the full-game license bit is set.
     rex::cvar::SetFlagByName("license_mask", "1");
+    // Xbox LIVE modes on the LAN: the game's rich presence is 0 on the title
+    // screen, 7 in every menu after it (main, Multiplayer, Xbox LIVE alike), 4
+    // in an online lobby and 3 in an online match. The LAN party is the
+    // players in a lobby or a match, and a party invite only brings in a
+    // player waiting in a lobby of their own (not one in the menus or
+    // mid-match).
+    rex::cvar::SetFlagByName("lan_party_presence", "3,4");
+    rex::cvar::SetFlagByName("lan_invite_presence", "4");
   }
 
   // Use the Xenos GPU emulation plugin (rexgpu-xenos.dll) unless the user
