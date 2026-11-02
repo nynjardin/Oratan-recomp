@@ -52,11 +52,12 @@ class OratanApp : public rex::ReXApp {
     // XBLA titles run as the trial unless the full-game license bit is set.
     rex::cvar::SetFlagByName("license_mask", "1");
     // Xbox LIVE modes on the LAN: the game's rich presence is 0 on the title
-    // screen, 7 in every menu after it (main, Multiplayer, Xbox LIVE alike), 4
-    // in an online lobby and 3 in an online match. The LAN party is the
-    // players in a lobby or a match, and a party invite only brings in a
-    // player waiting in a lobby of their own (not one in the menus or
-    // mid-match).
+    // screen, 7 in the main and Multiplayer menus, 2 in System Link, 4 from
+    // the Player Match menu on (its menu and every online lobby) and 3 once in
+    // an online match (it stays 3 on the results and back in the Player Match
+    // menu). The LAN party is the players at 3 or 4; a party invite brings in
+    // a player in the Player Match menu or a lobby of their own, and the last
+    // party match's players from anywhere in the online modes.
     rex::cvar::SetFlagByName("lan_party_presence", "3,4");
     rex::cvar::SetFlagByName("lan_invite_presence", "4");
   }

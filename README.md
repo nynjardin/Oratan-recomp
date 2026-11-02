@@ -138,9 +138,20 @@ PC whose VPN adapters hide its LAN address can be given it with
 **Xbox LIVE modes on the local network** (also experimental): tick it in F1
 (and restart), and **Multiplayer > Player Match** works between the PCs on
 the network: **Custom Match** opens a lobby, **Quick Match** on another PC
-finds it. There are no friends lists or invites, private matches can't be
-found, and the **Xbox LIVE Party Lobby** (the mode with observer slots) needs
-an Xbox Live party, which isn't emulated yet.
+finds it. There are no friends lists, and private matches can't be found.
+
+**Xbox LIVE Party Lobby** (up to 8 players: two fight, up to six watch, in
+turn): every PC on the network in **Multiplayer > Player Match** is in one
+party. One player hosts: **Xbox LIVE Party Lobby**, set **Observer** (up to 6),
+**OK**, then **Start** (Invite Xbox LIVE Party). Everyone in the Player Match
+menu or in a lobby of their own joins on their own: the next in line fights
+the host, the others watch (LIVE MONITOR). The match starts after a 20 s
+countdown (or when the host presses A); players who reach the Player Match
+menu during it still join, as observers. After the match the host picks
+**Return to lobby** and the party is invited again, with the next player in
+line as the opponent; the last opponent picks **Return to Xbox LIVE VS. Play
+menu** (their **Fight again** can't work: the party host has no rematch). The
+host fights every match.
 
 ### Hidden stages and Bradtos (Training)
 
@@ -173,7 +184,8 @@ crash or misbehave and are left out.
 | Online versus (netplay, F1 → Netplay) | Experimental, tested on one PC; see above |
 | System Link (local network versus) | Working, experimental, see above |
 | Xbox Live Player Match (Quick / Custom Match) on the local network | Working, experimental, see above |
-| Xbox Live Party Lobby (observers), Xbox Live over the internet | Not yet supported |
+| Xbox Live Party Lobby (observers, turns) on the local network | Working, experimental, see above |
+| Xbox Live over the internet | Not yet supported |
 
 ## Building from source
 

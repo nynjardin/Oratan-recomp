@@ -955,8 +955,51 @@ screen. The game resolves Xbox Live party functions by ordinal at boot (`sub_824
 `0x839F6574`: `XamPartyGetUserList` 0xAFF, `XamPartySendGameInvites` 0xB00,
 `XamPartySetCustomData` 0xB0B, `XamPartyGetBandwidth` 0xB10, `XamShowPartyUI` 0x305,
 `XamShowCommunitySessionsUI` 0x30B) and reads the party on `XN_PARTY_MEMBERS_CHANGED`
-(0x0E040002, `sub_82115048`, a 3,848-byte list). The SDK reports no party (0x807D0003). Next:
-emulate one party made of every console on the LAN, with game invites carried over the LAN.
+(0x0E040002, `sub_82115048`, a 3,848-byte list). The SDK reported no party (0x807D0003).
+
+**The LAN party** (SDK patch 0009): every console on the LAN is in one party. Each announces its
+player once a second (UDP 3076: XUID, gamertag, party custom data, hosted session, rich presence);
+the party list the game reads is built from that. The lobby's **Start** (`XamPartySendGameInvites`)
+sends an invite over the LAN; a console that takes it raises `XN_LIVE_INVITE_ACCEPTED` and the game
+asks for the details (`XInviteGetAcceptedInfo`, XLiveBase 0x58023), searches the host's session by
+ID (XGI 0x1B, single-session form) and joins it.
+
+**How the game runs the Party Lobby** (seen on three copies, 2026-10-30):
+
+- The rules screen sets Time limit, Round count and **Observer** (0-6); the lobby has
+  2 + observers private slots (up to 8 players). Its list shows the other party members.
+- The **first** player to join fights the host; everyone who joins after watches (LIVE
+  MONITOR). The match starts 20 s (1,200 ticks, `session+6212`) after the first one joins, or when
+  the host presses A. The host always fights.
+- After the match the host only has **Return to lobby** (a new session); the opponent has **Fight
+  again**, which asks the host for a rematch the host can't give, and then "Disconnected from
+  opponent"; observers go back to the Player Match menu.
+- The game only acts on an accepted invite in a menu (not on the results screen, not under a
+  dialog); it searches the host's session at once, and a session with nobody in it is "No
+  opponents found".
+- Rich presence (context 0x8001): 0 title screen, 7 main and Multiplayer menus, 2 System Link, 4
+  from the Player Match menu on (menu and lobbies), 3 from an online match on; it stays 3 on the
+  results and back in the Player Match menu.
+
+**So the SDK's party** (`lan_party_presence` "3,4", `lan_invite_presence` "4", set by Oratan):
+the party is the players at 3 or 4. The host's invite stands (sent once a second) while its lobby
+waits, and only once the host is in its own session; latecomers join during the countdown as
+observers. The invite names a **challenger**, the invitable member named longest ago, who takes it
+at once while the others wait 1.5 s, so the opponent rotates. The host's next lobby after a match
+invites again; a full lobby stops inviting, and a console ignores an invite to a session it knows
+is full. A console takes invites at presence 4, or at 3 or 4 from the last party host it joined
+(players of the last match), or from anyone once that host has left or stopped hosting. A console
+hosting the party or a public match ignores invites; the party host stops hosting only when it
+leaves its lobby from the lobby (after a match, a "Disconnected from opponent" dialog can hold it
+before its next lobby, if the opponent left the results first). An invite the game didn't act on
+is taken again after 6 s.
+
+**Results** (2026-10-30, copies on one PC driven by keyboard from a script): three copies, host +
+challenger + observer; a latecomer joined as observer during the countdown; four matches in a row,
+opponent B, C, B, C. Four copies: three matches, opponent D, B, C, the other two watching, every
+guest in every lobby. Host closed between matches: another player hosted (Observer 0, two slots),
+the last opponent joined from the results' presence, the third stayed in the menu without a
+"No opponents found". Not tested: real PCs, more than four consoles.
 
 ---
 

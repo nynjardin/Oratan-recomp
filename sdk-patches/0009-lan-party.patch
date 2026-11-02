@@ -1,0 +1,878 @@
+diff --git a/include/rex/system/lan_sessions.h b/include/rex/system/lan_sessions.h
+index 5362981..5c8d0dd 100644
+--- a/include/rex/system/lan_sessions.h
++++ b/include/rex/system/lan_sessions.h
+@@ -37,12 +37,34 @@ void HostModified(uint32_t session, uint32_t flags, uint32_t public_slots, uint3
+ void MembersJoined(uint32_t session, uint32_t count);
+ void MembersLeft(uint32_t session, uint32_t count);
+ void HostDeleted(uint32_t session);
++// A session this console joined (created as a guest), by its XSESSION_INFO.
++void Joined(const uint8_t* info);
+ 
+ // Writes an XSESSION_SEARCHRESULT_HEADER and its results at `buffer` (host
+ // pointer to the guest buffer at `guest_address`, `size` bytes): the sessions
+ // heard on the LAN, at most `max_results`, only those whose XNKID is in
+-// `session_ids` when it isn't null. Returns the number of results.
++// `session_ids` when it isn't null (a session without public slots is found
++// that way only). Returns the number of results.
+ uint32_t WriteSearchResults(uint8_t* buffer, uint32_t guest_address, uint32_t size,
+                             uint32_t max_results, const std::vector<uint64_t>* session_ids);
+ 
++// Xbox Live party: every console on the LAN is in one party with this one.
++// Each announces itself (XUID, gamertag, party custom data, hosted session)
++// once a second; XN_PARTY_MEMBERS_CHANGED tells the title when that changes.
++
++// XPARTY_USER_LIST (count, then up to 32 entries of 120 bytes) at `list`,
++// this console first among the members ordered by XUID. Returns the count.
++uint32_t WritePartyList(uint8_t* list);
++// XPARTY_CUSTOM_DATA (16 bytes) of this console's player.
++void SetPartyCustomData(const uint8_t* data);
++// Invites the party to the session this console hosts, which makes this
++// console the party's host: the invite stands while its lobby waits and its
++// next lobbies invite again. A console that hears it at an invitable presence
++// gets XN_LIVE_INVITE_ACCEPTED (once per session); the named challenger gets
++// a head start, so it joins first and fights the host.
++void SendPartyInvites();
++// The last invite accepted, as XINVITE_INFO (88 bytes) at `info`. False if
++// there's none.
++bool AcceptedInvite(uint8_t* info);
++
+ }  // namespace rex::system::lan_sessions
+diff --git a/src/kernel/xam/apps/xgi_app.cpp b/src/kernel/xam/apps/xgi_app.cpp
+index cdf5a0a..495983d 100644
+--- a/src/kernel/xam/apps/xgi_app.cpp
++++ b/src/kernel/xam/apps/xgi_app.cpp
+@@ -156,6 +156,10 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+                                     num_slots_public, num_slots_private);
+         }
+       }
++      // --lan_live: a guest's session carries the host's XSESSION_INFO.
++      if (system_link::Live() && (flags & 0x1u) == 0 && session_info_ptr) {
++        lan_sessions::Joined(memory_->TranslateVirtual<uint8_t*>(session_info_ptr));
++      }
+       if (system_link::Logging()) {
+         REXKRNL_INFO("net: XSessionCreate flags {:08X}, {} public / {} private slot(s){}", flags,
+                      num_slots_public, num_slots_private,
+@@ -339,6 +343,21 @@ X_HRESULT XgiApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       return X_E_SUCCESS;
+     }
+     case 0x000B001B: {
++      // XSessionSearchByID, one session: u32 user index, XNKID (8 bytes), u32
++      // results buffer size, results buffer. (The title's side answers the
++      // size query itself, so the buffer is always there.)
++      if (buffer_length == 20) {
++        const uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
++        uint64_t session_id;
++        std::memcpy(&session_id, buffer + 4, 8);
++        const uint32_t results_size = memory::load_and_swap<uint32_t>(buffer + 12);
++        const uint32_t results_ptr = memory::load_and_swap<uint32_t>(buffer + 16);
++        REXKRNL_DEBUG("XSessionSearchByID({}, {:016X}, {}, {:08X})", user_index, session_id,
++                      results_size, results_ptr);
++        const std::vector<uint64_t> ids{session_id};
++        WriteSearchResults(results_ptr, results_size, 1, &ids);
++        return X_E_SUCCESS;
++      }
+       assert_true(!buffer_length || buffer_length == 32);
+ 
+       uint32_t user_index = memory::load_and_swap<uint32_t>(buffer + 0);
+diff --git a/src/kernel/xam/apps/xlivebase_app.cpp b/src/kernel/xam/apps/xlivebase_app.cpp
+index 4c41940..77bea99 100644
+--- a/src/kernel/xam/apps/xlivebase_app.cpp
++++ b/src/kernel/xam/apps/xlivebase_app.cpp
+@@ -13,6 +13,7 @@
+ #include <rex/logging.h>
+ #include <rex/system/system_link.h>
+ #include <rex/thread.h>
++#include <rex/system/lan_sessions.h>
+ 
+ namespace rex {
+ namespace kernel {
+@@ -65,10 +66,21 @@ X_HRESULT XLiveBaseApp::DispatchMessageSync(uint32_t message, uint32_t buffer_pt
+       return X_E_FAIL;
+     }
+     case 0x00058023: {
+-      REXKRNL_DEBUG(
+-          "CXLiveMessaging::XMessageGameInviteGetAcceptedInfo({:08X}, {:08X}) "
+-          "unimplemented",
+-          buffer_ptr, buffer_length);
++      REXKRNL_DEBUG("CXLiveMessaging::XMessageGameInviteGetAcceptedInfo({:08X}, {:08X})",
++                    buffer_ptr, buffer_length);
++      // --lan_live: the party invite accepted on the LAN. The second argument
++      // is the call's parameter block: 16-byte entries (u32 type, 4 bytes,
++      // u64 value) counted at +512; entry 1 is where the XINVITE_INFO goes.
++      if (system_link::Live() && buffer_length) {
++        const uint8_t* block = memory_->TranslateVirtual<uint8_t*>(buffer_length);
++        const uint32_t count = memory::load_and_swap<uint32_t>(block + 512);
++        if (count >= 2) {
++          const uint32_t info = uint32_t(memory::load_and_swap<uint64_t>(block + 16 + 8));
++          if (info && lan_sessions::AcceptedInvite(memory_->TranslateVirtual<uint8_t*>(info))) {
++            return X_E_SUCCESS;
++          }
++        }
++      }
+       return X_E_FAIL;
+     }
+     case 0x00058046: {
+diff --git a/src/kernel/xam/xam_party.cpp b/src/kernel/xam/xam_party.cpp
+index d75d65e..3b3523a 100644
+--- a/src/kernel/xam/xam_party.cpp
++++ b/src/kernel/xam/xam_party.cpp
+@@ -14,6 +14,9 @@
+ #include <rex/types.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xtypes.h>
++#include <rex/system/lan_sessions.h>
++#include <rex/system/system_link.h>
++#include <rex/logging.h>
+ 
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+@@ -21,19 +24,47 @@
+ namespace rex {
+ namespace kernel {
+ namespace xam {
++using namespace rex::system;
+ 
+-u32 XamPartyGetUserList_entry(u32 player_count, mapped_u32 party_list) {
++// --lan_live: the console is in one Xbox Live party with every other console
++// on the LAN (rex/system/lan_sessions.h). Otherwise, in none.
++u32 XamPartyGetUserList_entry(u32 caller, mapped_u32 party_list) {
++  if (system_link::Live() && party_list) {
++    const uint32_t count =
++        lan_sessions::WritePartyList(static_cast<uint8_t*>(static_cast<void*>(party_list)));
++    if (system_link::Logging()) {
++      REXKRNL_INFO("net: XamPartyGetUserList -> {} member(s)", count);
++    }
++    return X_ERROR_SUCCESS;
++  }
+   // 5345085D wants specifically this code to skip loading party data.
+   // This code is not documented in NT_STATUS code list
+   return 0x807D0003;
+ }
+ 
+-u32 XamPartySendGameInvites_entry(u32 r3, u32 r4, u32 r5) {
+-  return X_ERROR_FUNCTION_FAILED;
++// Invites the party to the title's session (asynchronous on a console).
++u32 XamPartySendGameInvites_entry(u32 caller, u32 user_index, u32 reserved, u32 overlapped) {
++  if (!system_link::Live()) {
++    return X_ERROR_FUNCTION_FAILED;
++  }
++  lan_sessions::SendPartyInvites();
++  if (overlapped) {
++    REX_KERNEL_STATE()->CompleteOverlappedImmediate(overlapped, X_ERROR_SUCCESS);
++    return X_ERROR_IO_PENDING;
++  }
++  return X_ERROR_SUCCESS;
+ }
+ 
+-u32 XamPartySetCustomData_entry(u32 r3, u32 r4, u32 r5) {
+-  return X_ERROR_FUNCTION_FAILED;
++// XPARTY_CUSTOM_DATA (16 bytes) the title shares with the party.
++u32 XamPartySetCustomData_entry(u32 caller, u32 user_index, mapped_void data) {
++  if (!system_link::Live()) {
++    return X_ERROR_FUNCTION_FAILED;
++  }
++  lan_sessions::SetPartyCustomData(static_cast<const uint8_t*>(static_cast<void*>(data)));
++  if (system_link::Logging()) {
++    REXKRNL_INFO("net: XamPartySetCustomData");
++  }
++  return X_ERROR_SUCCESS;
+ }
+ 
+ u32 XamPartyGetBandwidth_entry(u32 r3, u32 r4) {
+diff --git a/src/kernel/xam/xam_ui.cpp b/src/kernel/xam/xam_ui.cpp
+index ed8e802..792ee24 100644
+--- a/src/kernel/xam/xam_ui.cpp
++++ b/src/kernel/xam/xam_ui.cpp
+@@ -28,6 +28,7 @@ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",
+ #include <rex/ui/imgui_drawer.h>
+ #include <rex/ui/window.h>
+ #include <rex/ui/windowed_app_context.h>
++#include <rex/system/system_link.h>
+ 
+ namespace rex {
+ namespace kernel {
+@@ -584,10 +585,16 @@ void XamShowDirtyDiscErrorUI_entry(u32 user_index) {
+ }
+ 
+ u32 XamShowPartyUI_entry(u32 r3, u32 r4) {
++  if (system_link::Live()) {
++    return xeXamShowUnavailableUI("XamShowPartyUI", r3);
++  }
+   return X_ERROR_FUNCTION_FAILED;
+ }
+ 
+ u32 XamShowCommunitySessionsUI_entry(u32 r3, u32 r4) {
++  if (system_link::Live()) {
++    return xeXamShowUnavailableUI("XamShowCommunitySessionsUI", r3);
++  }
+   return X_ERROR_FUNCTION_FAILED;
+ }
+ 
+diff --git a/src/system/lan_sessions.cpp b/src/system/lan_sessions.cpp
+index 1fcf704..54c5d63 100644
+--- a/src/system/lan_sessions.cpp
++++ b/src/system/lan_sessions.cpp
+@@ -7,6 +7,12 @@
+  *   XSESSION_INFO (60 bytes), u32 flags, u32 public slots, u32 private slots,
+  *   u32 filled public, u32 filled private, u16 contexts, u16 properties,
+  *   contexts (u32 id, u32 value), properties (u32 id, u16 size, bytes).
++ * Party member (kind 3): u64 XUID, gamertag (16 bytes), party custom data
++ *   (16 bytes), u8 hosting, XSESSION_INFO of the hosted session (60 bytes),
++ *   u32 rich presence (the title's X_CONTEXT_PRESENCE).
++ * Party invite (kind 4): u64 inviter XUID, u32 title id, XSESSION_INFO,
++ *   u64 XUID of the member to join first (the challenger; 0 = anyone). Sent
++ *   once a second while the inviter's lobby waits.
+  */
+ 
+ #include <rex/system/lan_sessions.h>
+@@ -18,11 +24,15 @@
+ #include <cstring>
+ #include <map>
+ #include <mutex>
++#include <sstream>
++#include <string>
+ #include <thread>
+ #include <vector>
+ 
++#include <rex/cvar.h>
+ #include <rex/logging.h>
+ #include <rex/platform.h>
++#include <rex/system/kernel_state.h>
+ #include <rex/system/system_link.h>
+ 
+ #if REX_PLATFORM_WIN32
+@@ -37,6 +47,13 @@
+ #include <unistd.h>
+ #endif
+ 
++REXCVAR_DEFINE_STRING(lan_party_presence, "", "Network",
++                      "With lan_live: the title's presence values (X_CONTEXT_PRESENCE, "
++                      "comma-separated) of the players who are in the LAN party. Empty: everyone");
++REXCVAR_DEFINE_STRING(lan_invite_presence, "", "Network",
++                      "With lan_live: the presence values at which this console accepts party "
++                      "invites. Empty: any");
++
+ namespace rex::system::lan_sessions {
+ namespace {
+ 
+@@ -44,10 +61,17 @@ using Clock = std::chrono::steady_clock;
+ 
+ constexpr uint16_t kPort = 3076;
+ constexpr char kMagic[4] = {'O', 'T', 'L', 'S'};
+-constexpr uint8_t kVersion = 1;
+-constexpr uint8_t kAnnounce = 1, kGone = 2;
++constexpr uint8_t kVersion = 3;
++constexpr uint8_t kAnnounce = 1, kGone = 2, kMember = 3, kInvite = 4;
+ constexpr auto kAnnounceEvery = std::chrono::milliseconds(1000);
+ constexpr auto kForgetAfter = std::chrono::milliseconds(3500);
++// The challenger's head start on an invite, and how long an accepted invite
++// waits for the title to join before it's accepted again.
++constexpr auto kChallengerFirst = std::chrono::milliseconds(1500);
++constexpr auto kAcceptAgainAfter = std::chrono::milliseconds(6000);
++// How long the party host may be without a lobby, after leaving one, before
++// it stops hosting.
++constexpr auto kLobbyGone = std::chrono::milliseconds(3000);
+ 
+ constexpr uint32_t kInfoSize = 60;          // XSESSION_INFO
+ constexpr uint32_t kResultSize = 92;        // XSESSION_SEARCHRESULT
+@@ -55,6 +79,32 @@ constexpr uint32_t kPropertySize = 24;      // XUSER_PROPERTY
+ constexpr uint32_t kContextSize = 8;        // XUSER_CONTEXT
+ constexpr uint32_t kMaxPropertyBytes = 256;
+ 
++// Xbox Live party.
++constexpr uint32_t kMaxPartyMembers = 32;
++constexpr uint32_t kPartyEntrySize = 120;  // XPARTY_USER_INFO
++constexpr uint32_t kCustomDataSize = 16;   // XPARTY_CUSTOM_DATA
++constexpr uint32_t kGamertagSize = 16;
++constexpr uint32_t kInviteInfoSize = 88;   // XINVITE_INFO
++constexpr uint32_t kPartyUserIsLocal = 0x1, kPartyUserInSession = 0x2;
++constexpr uint32_t kNatOpen = 1;
++constexpr XNotificationID kPartyMembersChanged = 0x0E040002;
++constexpr XNotificationID kLiveInviteAccepted = 0x02000002;
++constexpr uint32_t kContextPresence = 0x00008001;  // X_CONTEXT_PRESENCE
++
++// Whether `presence` is in a comma-separated list of values ("" = any).
++bool PresenceIn(const std::string& list, uint32_t presence) {
++  if (list.empty()) return true;
++  std::stringstream values(list);
++  std::string item;
++  while (std::getline(values, item, ',')) {
++    try {
++      if (!item.empty() && std::stoul(item, nullptr, 0) == presence) return true;
++    } catch (...) {
++    }
++  }
++  return false;
++}
++
+ struct Session {
+   std::array<uint8_t, kInfoSize> info{};
+   uint32_t flags = 0;
+@@ -82,6 +132,44 @@ Clock::time_point g_last_announce;
+ // Sessions heard on the LAN, by XNKID.
+ std::map<uint64_t, Session> g_heard;
+ 
++// The party: this console's player and the others heard on the LAN.
++struct Member {
++  std::array<char, kGamertagSize> gamertag{};
++  std::array<uint8_t, kCustomDataSize> custom{};
++  bool hosting = false;
++  std::array<uint8_t, kInfoSize> session{};
++  uint32_t presence = 0;
++  Clock::time_point heard;
++};
++std::array<uint8_t, kCustomDataSize> g_custom{};
++std::map<uint64_t, Member> g_members;  // by XUID
++uint64_t g_party_signature = 0;        // what the title was last told about
++Clock::time_point g_last_member_announce;
++// The last invite heard, and the session it was for.
++struct Invite {
++  uint64_t inviter = 0;
++  uint32_t title_id = 0;
++  std::array<uint8_t, kInfoSize> session{};
++};
++Invite g_invite;
++bool g_have_invite = false;
++uint64_t g_invited_to = 0;
++Clock::time_point g_accepted_at;
++uint64_t g_joined = 0;  // XNKID of the last session this console joined
++uint64_t g_last_host = 0;  // XUID of the last inviter whose invite was taken
++std::map<uint64_t, Clock::time_point> g_invite_heard;  // by session: first heard
++// The party's host: this console invited the party. Its invite stands while
++// its lobby waits (latecomers join as observers), and its next lobbies (after
++// a match) invite the party again. The challenger, who fights the host, is
++// the invitable member named longest ago.
++bool g_party_host = false;
++bool g_inviting = false;
++uint64_t g_challenger = 0;
++Clock::time_point g_last_invite;
++Clock::time_point g_host_left;  // when the hosted session last ended
++bool g_left_lobby = false;      // ...from its lobby, not from a match
++std::map<uint64_t, Clock::time_point> g_last_named;  // by XUID
++
+ #if REX_PLATFORM_WIN32
+ using NativeSocket = SOCKET;
+ constexpr NativeSocket kNoSocket = INVALID_SOCKET;
+@@ -100,12 +188,19 @@ void Put16(std::vector<uint8_t>& out, uint16_t v) {
+ void Put32(std::vector<uint8_t>& out, uint32_t v) {
+   for (int shift = 24; shift >= 0; shift -= 8) out.push_back(uint8_t(v >> shift));
+ }
++void Put64(std::vector<uint8_t>& out, uint64_t v) {
++  for (int shift = 56; shift >= 0; shift -= 8) out.push_back(uint8_t(v >> shift));
++}
+ void Store32(uint8_t* p, uint32_t v) {
+   p[0] = uint8_t(v >> 24);
+   p[1] = uint8_t(v >> 16);
+   p[2] = uint8_t(v >> 8);
+   p[3] = uint8_t(v);
+ }
++void Store64(uint8_t* p, uint64_t v) {
++  Store32(p, uint32_t(v >> 32));
++  Store32(p + 4, uint32_t(v));
++}
+ 
+ class Reader {
+  public:
+@@ -129,6 +224,12 @@ class Reader {
+     *v = uint32_t(b[0]) << 24 | uint32_t(b[1]) << 16 | uint32_t(b[2]) << 8 | b[3];
+     return true;
+   }
++  bool U64(uint64_t* v) {
++    uint32_t high = 0, low = 0;
++    if (!U32(&high) || !U32(&low)) return false;
++    *v = uint64_t(high) << 32 | low;
++    return true;
++  }
+ 
+  private:
+   const uint8_t* data_;
+@@ -162,6 +263,103 @@ std::vector<uint8_t> HostedPacket(uint8_t kind) {
+   return out;
+ }
+ 
++std::vector<uint8_t> Header(uint8_t kind) {
++  std::vector<uint8_t> out(kMagic, kMagic + 4);
++  out.push_back(kVersion);
++  out.push_back(kind);
++  Put16(out, 0);
++  return out;
++}
++
++uint32_t OwnPresence() {
++  const auto it = g_contexts.find(kContextPresence);
++  return it != g_contexts.end() ? it->second : 0;
++}
++
++// The members the title is told about: those at a presence that puts them in
++// the party (lan_party_presence).
++bool InParty(const Member& member) {
++  return PresenceIn(REXCVAR_GET(lan_party_presence), member.presence);
++}
++
++// Whether a member would take an invite now (lan_invite_presence).
++bool Invitable(const Member& member) {
++  return PresenceIn(REXCVAR_GET(lan_invite_presence), member.presence);
++}
++
++// The next challenger: the invitable member named longest ago (never first,
++// then by XUID); 0 if none. g_mutex held.
++uint64_t PickChallenger() {
++  uint64_t best = 0;
++  Clock::time_point best_named = Clock::time_point::max();
++  for (const auto& [xuid, member] : g_members) {
++    if (!Invitable(member)) continue;
++    const auto it = g_last_named.find(xuid);
++    const Clock::time_point named = it != g_last_named.end() ? it->second : Clock::time_point{};
++    if (named < best_named) {
++      best = xuid;
++      best_named = named;
++    }
++  }
++  if (best) g_last_named[best] = Clock::now();
++  return best;
++}
++
++// This console's player as a party member; g_mutex held.
++std::vector<uint8_t> MemberPacket() {
++  std::vector<uint8_t> out = Header(kMember);
++  Put64(out, system_link::PlayerXuid());
++  std::array<char, kGamertagSize> gamertag{};
++  const std::string name = system_link::PlayerName();
++  std::memcpy(gamertag.data(), name.data(), std::min<size_t>(name.size(), kGamertagSize - 1));
++  out.insert(out.end(), gamertag.begin(), gamertag.end());
++  out.insert(out.end(), g_custom.begin(), g_custom.end());
++  out.push_back(g_hosted_object ? 1 : 0);
++  if (g_hosted_object) {
++    out.insert(out.end(), g_hosted.info.begin(), g_hosted.info.end());
++  } else {
++    out.insert(out.end(), kInfoSize, 0);
++  }
++  Put32(out, OwnPresence());
++  return out;
++}
++
++// What the title knows about the party; changes are worth a notification.
++uint64_t PartySignature() {
++  uint64_t h = 0xCBF29CE484222325ull;
++  const auto mix = [&](const uint8_t* data, size_t size) {
++    for (size_t i = 0; i < size; ++i) h = (h ^ data[i]) * 0x100000001B3ull;
++  };
++  for (const auto& [xuid, member] : g_members) {
++    if (!InParty(member)) continue;
++    mix(reinterpret_cast<const uint8_t*>(&xuid), sizeof(xuid));
++    mix(member.custom.data(), member.custom.size());
++    const uint8_t hosting = member.hosting;
++    mix(&hosting, 1);
++    mix(member.session.data(), 8);
++  }
++  mix(g_custom.data(), g_custom.size());
++  return h;
++}
++
++// Tells the title the party changed, if it did. Not under g_mutex: the
++// kernel takes its own locks.
++void NotifyPartyIfChanged() {
++  uint64_t signature;
++  {
++    std::lock_guard lock(g_mutex);
++    signature = PartySignature();
++    if (signature == g_party_signature) return;
++    g_party_signature = signature;
++    if (system_link::Logging()) {
++      REXSYS_INFO("lan party: {} other member(s); telling the title", g_members.size());
++    }
++  }
++  if (auto* kernel = REX_KERNEL_STATE()) {
++    kernel->BroadcastNotification(kPartyMembersChanged, 0);
++  }
++}
++
+ void SendToLan(const std::vector<uint8_t>& packet) {
+   if (g_socket == kNoSocket) return;
+   std::vector<uint32_t> targets = system_link::BroadcastCopies();
+@@ -179,15 +377,129 @@ void SendToLan(const std::vector<uint8_t>& packet) {
+   }
+ }
+ 
++void ReceiveMember(Reader& in) {
++  uint64_t xuid = 0;
++  Member m;
++  uint8_t hosting = 0;
++  if (!in.U64(&xuid) || !in.Bytes(m.gamertag.data(), kGamertagSize) ||
++      !in.Bytes(m.custom.data(), kCustomDataSize) || !in.U8(&hosting) ||
++      !in.Bytes(m.session.data(), kInfoSize) || !in.U32(&m.presence)) {
++    return;
++  }
++  if (xuid == system_link::PlayerXuid()) return;  // our own
++  m.gamertag.back() = 0;
++  m.hosting = hosting != 0;
++  m.heard = Clock::now();
++  {
++    std::lock_guard lock(g_mutex);
++    if (g_members.find(xuid) == g_members.end() && system_link::Logging()) {
++      REXSYS_INFO("lan party: {} joined", m.gamertag.data());
++    }
++    g_members[xuid] = m;
++  }
++  NotifyPartyIfChanged();
++}
++
++// The standing invite to the hosted session; g_mutex held.
++void SendInvite() {
++  std::vector<uint8_t> out = Header(kInvite);
++  Put64(out, system_link::PlayerXuid());
++  Put32(out, REX_KERNEL_STATE() ? REX_KERNEL_STATE()->title_id() : 0);
++  out.insert(out.end(), g_hosted.info.begin(), g_hosted.info.end());
++  Put64(out, g_challenger);
++  SendToLan(out);
++  g_last_invite = Clock::now();
++}
++
++void ReceiveInvite(Reader& in) {
++  Invite invite;
++  uint64_t challenger = 0;
++  if (!in.U64(&invite.inviter) || !in.U32(&invite.title_id) ||
++      !in.Bytes(invite.session.data(), kInfoSize) || !in.U64(&challenger)) {
++    return;
++  }
++  const uint64_t session = KeyOf(invite.session.data());
++  const uint64_t self = system_link::PlayerXuid();
++  {
++    std::lock_guard lock(g_mutex);
++    const auto now = Clock::now();
++    if (invite.inviter == self || (g_hosted_object && session == KeyOf(g_hosted.info.data())) ||
++        session == g_joined) {
++      return;  // ours, or already in it
++    }
++    if (session == g_invited_to && now - g_accepted_at < kAcceptAgainAfter) {
++      return;  // accepted; the title is joining
++    }
++    const auto heard = g_heard.find(session);
++    if (heard != g_heard.end() &&
++        heard->second.filled_public + heard->second.filled_private >=
++            heard->second.public_slots + heard->second.private_slots) {
++      return;  // full: the title would find no room
++    }
++    const bool first = g_invite_heard.emplace(session, now).second;
++    if (g_party_host || (g_hosted_object && g_hosted.public_slots > 0)) {
++      if (first && system_link::Logging()) {
++        REXSYS_INFO("lan party: invite ignored (this console hosts a {})",
++                    g_party_host ? "party" : "match");
++      }
++      return;
++    }
++    // Only where the player can take one (lan_invite_presence): not in a
++    // match, not outside the online menus. The host of the last party match
++    // brings its players back from anywhere in the online modes (a match's
++    // players keep the match's presence on its results and in the menus), and
++    // so does a new host once that one has left or stopped hosting.
++    const auto last_host = g_members.find(g_last_host);
++    const bool last_host_gone = last_host == g_members.end() || !last_host->second.hosting;
++    const bool back_to_host = g_last_host && (invite.inviter == g_last_host || last_host_gone) &&
++                              PresenceIn(REXCVAR_GET(lan_party_presence), OwnPresence());
++    if (!back_to_host && !PresenceIn(REXCVAR_GET(lan_invite_presence), OwnPresence())) {
++      if (first && system_link::Logging()) {
++        REXSYS_INFO("lan party: invite ignored at presence {}", OwnPresence());
++      }
++      return;
++    }
++    // The challenger joins first, so it takes the opponent's place.
++    if (challenger && challenger != self && g_members.count(challenger) &&
++        now - g_invite_heard[session] < kChallengerFirst) {
++      return;
++    }
++    g_invite = invite;
++    g_have_invite = true;
++    g_invited_to = session;
++    g_accepted_at = now;
++    g_last_host = invite.inviter;
++    if (system_link::Logging()) {
++      REXSYS_INFO("lan party: invited to a session{}; accepting",
++                  challenger == self ? " as the challenger" : "");
++    }
++  }
++  // The console accepts party invites by itself; the title asks for the
++  // details (XInviteGetAcceptedInfo) when it hears of it.
++  if (auto* kernel = REX_KERNEL_STATE()) {
++    kernel->BroadcastNotification(kLiveInviteAccepted, 0);
++  }
++}
++
+ void Receive(const uint8_t* data, size_t size, uint32_t from) {
+   Reader in(data, size);
+   char magic[4];
+   uint8_t version = 0, kind = 0;
+   uint16_t reserved = 0;
+-  Session s;
+   if (!in.Bytes(magic, 4) || std::memcmp(magic, kMagic, 4) != 0 || !in.U8(&version) ||
+-      version != kVersion || !in.U8(&kind) || !in.U16(&reserved) ||
+-      !in.Bytes(s.info.data(), kInfoSize)) {
++      version != kVersion || !in.U8(&kind) || !in.U16(&reserved)) {
++    return;
++  }
++  if (kind == kMember) {
++    ReceiveMember(in);
++    return;
++  }
++  if (kind == kInvite) {
++    ReceiveInvite(in);
++    return;
++  }
++  Session s;
++  if (!in.Bytes(s.info.data(), kInfoSize)) {
+     return;
+   }
+   const uint64_t key = KeyOf(s.info.data());
+@@ -246,7 +558,48 @@ void Run() {
+       for (auto it = g_heard.begin(); it != g_heard.end();) {
+         it = now - it->second.heard > kForgetAfter ? g_heard.erase(it) : std::next(it);
+       }
++      if (now - g_last_member_announce >= kAnnounceEvery) {
++        SendToLan(MemberPacket());
++        g_last_member_announce = now;
++      }
++      // The party host's invite stands while its lobby waits (not in a match)
++      // and has room, once the host is in it: a session without players is
++      // passed over.
++      const uint32_t filled = g_hosted.filled_public + g_hosted.filled_private;
++      if (g_inviting && g_hosted_object && filled > 0 &&
++          filled < g_hosted.public_slots + g_hosted.private_slots &&
++          PresenceIn(REXCVAR_GET(lan_invite_presence), OwnPresence()) &&
++          now - g_last_invite >= kAnnounceEvery) {
++        if (!g_challenger || !g_members.count(g_challenger)) {
++          g_challenger = PickChallenger();
++          if (g_challenger && system_link::Logging()) {
++            REXSYS_INFO("lan party: challenger {}", g_members[g_challenger].gamertag.data());
++          }
++        }
++        SendInvite();
++      }
++      // A host that left its lobby can be invited again. One back from a match
++      // keeps hosting until its next lobby (a dialog may hold it on the way).
++      if (g_party_host && !g_hosted_object && g_left_lobby && now - g_host_left > kLobbyGone) {
++        g_party_host = false;
++        if (system_link::Logging()) REXSYS_INFO("lan party: no longer the party's host");
++      }
++      for (auto it = g_invite_heard.begin(); it != g_invite_heard.end();) {
++        it = now - it->second > std::chrono::seconds(60) ? g_invite_heard.erase(it)
++                                                          : std::next(it);
++      }
++      for (auto it = g_members.begin(); it != g_members.end();) {
++        if (now - it->second.heard > kForgetAfter) {
++          if (system_link::Logging()) {
++            REXSYS_INFO("lan party: {} left", it->second.gamertag.data());
++          }
++          it = g_members.erase(it);
++        } else {
++          ++it;
++        }
++      }
+     }
++    NotifyPartyIfChanged();
+     fd_set read_set;
+     FD_ZERO(&read_set);
+     FD_SET(g_socket, &read_set);
+@@ -309,7 +662,21 @@ void Start() {
+ void SetContext(uint32_t user_index, uint32_t context_id, uint32_t value) {
+   if (!system_link::Live() || user_index != 0) return;
+   std::lock_guard lock(g_mutex);
++  const auto it = g_contexts.find(context_id);
++  const bool changed = it == g_contexts.end() || it->second != value;
++  if (system_link::Logging() && changed) {
++    REXSYS_INFO("lan sessions: context {:08X} = {}", context_id, value);
++  }
+   g_contexts[context_id] = value;
++  if (changed && context_id == kContextPresence && g_party_host &&
++      !PresenceIn(REXCVAR_GET(lan_party_presence), value)) {
++    g_party_host = false;  // left the online menus
++    g_inviting = false;
++  }
++  if (changed && context_id == kContextPresence && g_socket != kNoSocket) {
++    SendToLan(MemberPacket());
++    g_last_member_announce = Clock::now();
++  }
+ }
+ 
+ void SetProperty(uint32_t user_index, uint32_t property_id, const uint8_t* data, uint32_t size) {
+@@ -329,17 +696,28 @@ void HostCreated(uint32_t session, const uint8_t* info, uint32_t flags, uint32_t
+   g_hosted.flags = flags;
+   g_hosted.public_slots = public_slots;
+   g_hosted.private_slots = private_slots;
+-  // Private sessions (no public slot) aren't for strangers to find.
+-  if (public_slots == 0) {
+-    g_hosted_object = 0;
+-    return;
+-  }
++  // Announced even without public slots (a party's session): searches find it
++  // by its ID only.
+   SendToLan(HostedPacket(kAnnounce));
++  SendToLan(MemberPacket());
+   g_last_announce = Clock::now();
+   if (system_link::Logging()) {
+     REXSYS_INFO("lan sessions: announcing this console's session ({} public slot(s))",
+                 public_slots);
+   }
++  // The party host's new lobby (back from a match) invites the party again.
++  g_inviting = g_party_host && public_slots == 0;
++  g_challenger = 0;
++  g_last_invite = Clock::time_point{};
++  if (g_inviting && system_link::Logging()) {
++    REXSYS_INFO("lan party: inviting the party to the new lobby");
++  }
++}
++
++void Joined(const uint8_t* info) {
++  if (!system_link::Live() || !info) return;
++  std::lock_guard lock(g_mutex);
++  g_joined = KeyOf(info);
+ }
+ 
+ void HostModified(uint32_t session, uint32_t flags, uint32_t public_slots,
+@@ -351,16 +729,34 @@ void HostModified(uint32_t session, uint32_t flags, uint32_t public_slots,
+   g_hosted.private_slots = private_slots;
+ }
+ 
++// Players take public slots while there are some, then private ones (a
++// party's session has only private slots, and a session with no one in it
++// is passed over by searchers).
+ void MembersJoined(uint32_t session, uint32_t count) {
+   std::lock_guard lock(g_mutex);
+   if (!g_hosted_object || session != g_hosted_object) return;
+-  g_hosted.filled_public = std::min(g_hosted.public_slots, g_hosted.filled_public + count);
++  for (uint32_t i = 0; i < count; ++i) {
++    if (g_hosted.filled_public < g_hosted.public_slots) {
++      ++g_hosted.filled_public;
++    } else if (g_hosted.filled_private < g_hosted.private_slots) {
++      ++g_hosted.filled_private;
++    }
++  }
++  // Searchers (invited players among them) see the new count at once.
++  SendToLan(HostedPacket(kAnnounce));
++  g_last_announce = Clock::now();
+ }
+ 
+ void MembersLeft(uint32_t session, uint32_t count) {
+   std::lock_guard lock(g_mutex);
+   if (!g_hosted_object || session != g_hosted_object) return;
+-  g_hosted.filled_public = g_hosted.filled_public > count ? g_hosted.filled_public - count : 0;
++  for (uint32_t i = 0; i < count; ++i) {
++    if (g_hosted.filled_private > 0) {
++      --g_hosted.filled_private;
++    } else if (g_hosted.filled_public > 0) {
++      --g_hosted.filled_public;
++    }
++  }
+ }
+ 
+ void HostDeleted(uint32_t session) {
+@@ -368,6 +764,9 @@ void HostDeleted(uint32_t session) {
+   if (!g_hosted_object || session != g_hosted_object) return;
+   SendToLan(HostedPacket(kGone));
+   g_hosted_object = 0;
++  g_inviting = false;
++  g_host_left = Clock::now();
++  g_left_lobby = PresenceIn(REXCVAR_GET(lan_invite_presence), OwnPresence());
+   if (system_link::Logging()) {
+     REXSYS_INFO("lan sessions: this console's session ended");
+   }
+@@ -385,6 +784,9 @@ uint32_t WriteSearchResults(uint8_t* buffer, uint32_t guest_address, uint32_t si
+           std::find(session_ids->begin(), session_ids->end(), key) == session_ids->end()) {
+         continue;
+       }
++      if (!session_ids && session.public_slots == 0) {
++        continue;  // private: by ID only
++      }
+       found.push_back(session);
+     }
+   }
+@@ -457,4 +859,89 @@ uint32_t WriteSearchResults(uint8_t* buffer, uint32_t guest_address, uint32_t si
+   return count;
+ }
+ 
++uint32_t WritePartyList(uint8_t* list) {
++  Start();
++  std::memset(list, 0, 8 + kMaxPartyMembers * kPartyEntrySize);
++  std::lock_guard lock(g_mutex);
++  // Everyone sees the same order: by XUID.
++  std::map<uint64_t, const Member*> ordered;
++  Member self;
++  const std::string name = system_link::PlayerName();
++  std::memcpy(self.gamertag.data(), name.data(), std::min<size_t>(name.size(), kGamertagSize - 1));
++  self.custom = g_custom;
++  self.hosting = g_hosted_object != 0;
++  if (self.hosting) self.session = g_hosted.info;
++  const uint64_t self_xuid = system_link::PlayerXuid();
++  ordered[self_xuid] = &self;
++  for (const auto& [xuid, member] : g_members) {
++    if (InParty(member)) ordered[xuid] = &member;
++  }
++  const uint32_t title_id = REX_KERNEL_STATE() ? REX_KERNEL_STATE()->title_id() : 0;
++  uint32_t count = 0;
++  for (const auto& [xuid, member] : ordered) {
++    if (count == kMaxPartyMembers) break;
++    // XPARTY_USER_INFO: XUID, gamertag, user index, NAT type, title id,
++    // flags, XSESSION_INFO, 4 bytes padding, XPARTY_CUSTOM_DATA.
++    uint8_t* entry = list + 8 + count * kPartyEntrySize;
++    const bool local = xuid == self_xuid;
++    Store64(entry, xuid);
++    std::memcpy(entry + 8, member->gamertag.data(), kGamertagSize);
++    Store32(entry + 24, local ? 0 : 0xFFFFFFFF);
++    Store32(entry + 28, kNatOpen);
++    Store32(entry + 32, title_id);
++    Store32(entry + 36, (local ? kPartyUserIsLocal : 0) |
++                            (member->hosting ? kPartyUserInSession : 0));
++    if (member->hosting) std::memcpy(entry + 40, member->session.data(), kInfoSize);
++    std::memcpy(entry + 104, member->custom.data(), kCustomDataSize);
++    ++count;
++  }
++  Store32(list, count);
++  return count;
++}
++
++void SetPartyCustomData(const uint8_t* data) {
++  if (!data) return;
++  Start();
++  {
++    std::lock_guard lock(g_mutex);
++    std::memcpy(g_custom.data(), data, kCustomDataSize);
++    SendToLan(MemberPacket());
++    g_last_member_announce = Clock::now();
++  }
++  NotifyPartyIfChanged();
++}
++
++void SendPartyInvites() {
++  Start();
++  std::lock_guard lock(g_mutex);
++  if (!g_hosted_object) {
++    if (system_link::Logging()) REXSYS_INFO("lan party: invites without a hosted session");
++    return;
++  }
++  g_party_host = true;
++  g_inviting = true;
++  g_challenger = PickChallenger();
++  SendInvite();
++  if (system_link::Logging()) {
++    REXSYS_INFO("lan party: inviting the party to this console's session (challenger {})",
++                g_challenger ? g_members[g_challenger].gamertag.data() : "anyone");
++  }
++}
++
++bool AcceptedInvite(uint8_t* info) {
++  std::lock_guard lock(g_mutex);
++  if (!g_have_invite || !info) return false;
++  g_party_host = false;
++  g_inviting = false;
++  // XINVITE_INFO: inviter XUID, invitee XUID, title id, host's
++  // XSESSION_INFO, from a game invite.
++  std::memset(info, 0, kInviteInfoSize);
++  Store64(info, g_invite.inviter);
++  Store64(info + 8, system_link::PlayerXuid());
++  Store32(info + 16, g_invite.title_id);
++  std::memcpy(info + 20, g_invite.session.data(), kInfoSize);
++  Store32(info + 80, 1);
++  return true;
++}
++
+ }  // namespace rex::system::lan_sessions
