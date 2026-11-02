@@ -6,7 +6,8 @@
 //   - sub_821135C0 reads the controllers into game::kControllerStates
 //     (4 x 60 bytes), once per tick on the Update thread (measured).
 // Order after a read: netplay first (it replaces the buffer with both players'
-// inputs), then the replay (recording stores what the game actually used).
+// inputs), then the replay (recording stores what the game actually used),
+// then the LAN party's menu presses (party_rotation.cpp).
 
 #include <rex/hook.h>
 
@@ -54,6 +55,7 @@ REX_HOOK_RAW(sub_821236E0) {
   __imp__sub_821236E0(ctx, base);
   oratan::netplay::OnTickEnd(base);
   oratan::replay::OnTickEnd(base);
+  oratan::party_rotation::OnTickEnd(base);
 }
 
 // sub_821135C0: reads the controllers into game::kControllerStates.
@@ -63,4 +65,5 @@ REX_HOOK_RAW(sub_821135C0) {
   __imp__sub_821135C0(ctx, base);
   oratan::netplay::OnControllerRead(base);
   oratan::replay::OnControllerRead(base);
+  oratan::party_rotation::OnControllerRead(base);
 }

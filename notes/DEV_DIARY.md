@@ -1001,6 +1001,43 @@ guest in every lobby. Host closed between matches: another player hosted (Observ
 the last opponent joined from the results' presence, the third stayed in the menu without a
 "No opponents found". Not tested: real PCs, more than four consoles.
 
+**Who won** (2026-10-31, for a winner-stays rotation; named in `game_memory.h`). As the step goes
+to `kDecided`, `sub_821C32C8` writes the round's result for side 1 to `game+0x6157` (0 KO, 1 time,
+2 perfect, 3-5 the same lost, 6 draw; 0xFF while undecided). `sub_821C3A60` counts rounds won
+per side at `game+740` / `+744` (a draw counts for both), and `sub_821C2EB8` ends the match when
+one exceeds `game+0x6153` (rounds to win minus one). Online, `kOnlineInput+80` (0x829BF3F0) is
+this console's side: 0 the session host, 1 the opponent, 2 an observer. Seen with three copies
+in a one-round Party Lobby match the opponent won on time: result 4, side 2 one round, the
+same on host, opponent and observer; sides 0, 1, 2.
+
+**The online menus** (2026-10-31, from captures compared across screens): `0x829C7D74` is the menu
+screen (8 Multiplayer, 22 SELECT VR, 23 Player Match, 24 Party Lobby settings, 25 a lobby, 26-27
+the match and its results, 28 the host's way back to its lobby); dialogs don't change it. The
+Player Match cursor is at `0x829C93A8`, the results cursor at `0x82B038F8` (an opponent's: 0
+Fight again ... 4 Return to Xbox LIVE VS. Play menu; the host's opens on Return to lobby). The
+settings are at `0x829C9028` (time, an index: 2 = 80 s), `+4` rounds minus one, `+12` observers;
+a fresh settings screen shows 80 s, 2 rounds, 0 observers. Back in a host's lobby goes straight
+to the settings, no dialog. Controller bits in `ControllerState::held`: A 0x4, B 0x2, Start 0x200,
+up/right/down/left 0x1000/0x2000/0x4000/0x8000. Menu cursors move on `+20`, which the read fills
+with the press and then a repeat for the directions (mask at `+240` of its settings), so a
+synthetic direction has to set it too; A and B work from `pressed` alone.
+
+**Winner stays** (`src/party_rotation.cpp`, SDK patch 0010, F1 option, default on). When a party
+match is decided each console reports its side and the winner to the SDK (`PartyMatchOver`),
+which gives its role and moves the host role: a losing host's next lobby neither invites nor
+takes invites, a winning opponent's next lobby invites the party. Members announce the number of
+the last match they fought, and the challenger is the one who fought longest ago (the host's own
+"named longest ago" order didn't survive a change of host). Oratan then walks the menus by
+pressing buttons on the active controller, 6 s after the decision, reading the screen and cursors
+before each press and pressing again until the screen changes: host won, Return to lobby; host
+lost, Return to lobby, Back, Back; opponent lost, Return to Xbox LIVE VS. Play menu; opponent
+won, the same, then Party Lobby, the old host's settings written into the settings screen
+(announced with each member as `SetPartyRules`), OK. **Results** (three copies, five matches in
+a row): A hosted, B won and hosted with A's settings, C (never fought) was its challenger and A
+watched; a time-up draw kept B hosting with A as challenger; A won and hosted, C challenger, B
+watching. Not tested: real PCs, a "Disconnected from opponent" dialog on the way (presses retry
+through it), multi-round matches.
+
 ---
 
 *Working notes with every detail and the full history: `work\DIARY.md`. Model formats and

@@ -147,11 +147,18 @@ party. One player hosts: **Xbox LIVE Party Lobby**, set **Observer** (up to 6),
 menu or in a lobby of their own joins on their own: the next in line fights
 the host, the others watch (LIVE MONITOR). The match starts after a 20 s
 countdown (or when the host presses A); players who reach the Player Match
-menu during it still join, as observers. After the match the host picks
-**Return to lobby** and the party is invited again, with the next player in
-line as the opponent; the last opponent picks **Return to Xbox LIVE VS. Play
-menu** (their **Fight again** can't work: the party host has no rematch). The
-host fights every match.
+menu during it still join, as observers.
+
+After each match the winner stays: nobody has to touch anything, the game
+leaves the results by itself a few seconds later. If the host won, it goes
+back to its lobby and invites the party again. If the opponent won, it becomes
+the host: it opens a Party Lobby of its own with the same settings and invites
+the party, and the old host joins the line. The next opponent is whoever
+fought longest ago; everyone else watches. A draw counts as the host's win.
+F1 > **After a Party Lobby match** can instead keep the first host fighting
+every match (**Host always fights**), or turn this off and leave the results
+by hand (**Off**: the host picks **Return to lobby**, the last opponent
+**Return to Xbox LIVE VS. Play menu**).
 
 ### Hidden stages and Bradtos (Training)
 

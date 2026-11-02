@@ -1,0 +1,220 @@
+diff --git a/include/rex/system/lan_sessions.h b/include/rex/system/lan_sessions.h
+index 5c8d0dd..497a479 100644
+--- a/include/rex/system/lan_sessions.h
++++ b/include/rex/system/lan_sessions.h
+@@ -67,4 +67,30 @@ void SendPartyInvites();
+ // there's none.
+ bool AcceptedInvite(uint8_t* info);
+ 
++// Winner stays: the title reports each match's end and the SDK moves the
++// party's host role to the winner. Each console announces the number of the
++// last match it fought in; the next challenger is the invitable member who
++// fought longest ago.
++
++// What this console does after a party match.
++enum class PartyRole {
++  kNone,        // not a party match
++  kHost,        // the host won: it keeps hosting (back to its lobby)
++  kStepDown,    // the host lost: it stops hosting and queues with the others
++  kBecomeHost,  // the opponent won: its next lobby invites the party
++  kRejoin,      // the opponent lost: back to the menu, to queue
++  kWatch,       // an observer
++};
++// The match this console was in ended: `local_side` 0 = the session's host, 1
++// = the opponent, other = an observer; `winner_side` the side that won (pass
++// 0 to keep the host fighting). Call once per match.
++PartyRole PartyMatchOver(int local_side, int winner_side);
++// The title's party rules (kPartyRulesSize opaque bytes: whatever a new host
++// needs to set up the same lobby), announced with this console's player.
++constexpr uint32_t kPartyRulesSize = 4;
++void SetPartyRules(const uint8_t* rules);
++// The rules announced by the host whose invite this console last took. False
++// if that host isn't heard any more.
++bool LastHostRules(uint8_t* rules);
++
+ }  // namespace rex::system::lan_sessions
+diff --git a/src/system/lan_sessions.cpp b/src/system/lan_sessions.cpp
+index 54c5d63..55a6ad3 100644
+--- a/src/system/lan_sessions.cpp
++++ b/src/system/lan_sessions.cpp
+@@ -9,7 +9,8 @@
+  *   contexts (u32 id, u32 value), properties (u32 id, u16 size, bytes).
+  * Party member (kind 3): u64 XUID, gamertag (16 bytes), party custom data
+  *   (16 bytes), u8 hosting, XSESSION_INFO of the hosted session (60 bytes),
+- *   u32 rich presence (the title's X_CONTEXT_PRESENCE).
++ *   u32 rich presence (the title's X_CONTEXT_PRESENCE), u32 number of the
++ *   last match fought (0 = none yet), party rules (4 bytes, the title's).
+  * Party invite (kind 4): u64 inviter XUID, u32 title id, XSESSION_INFO,
+  *   u64 XUID of the member to join first (the challenger; 0 = anyone). Sent
+  *   once a second while the inviter's lobby waits.
+@@ -61,7 +62,7 @@ using Clock = std::chrono::steady_clock;
+ 
+ constexpr uint16_t kPort = 3076;
+ constexpr char kMagic[4] = {'O', 'T', 'L', 'S'};
+-constexpr uint8_t kVersion = 3;
++constexpr uint8_t kVersion = 4;
+ constexpr uint8_t kAnnounce = 1, kGone = 2, kMember = 3, kInvite = 4;
+ constexpr auto kAnnounceEvery = std::chrono::milliseconds(1000);
+ constexpr auto kForgetAfter = std::chrono::milliseconds(3500);
+@@ -139,9 +140,15 @@ struct Member {
+   bool hosting = false;
+   std::array<uint8_t, kInfoSize> session{};
+   uint32_t presence = 0;
++  uint32_t last_match = 0;
++  std::array<uint8_t, kPartyRulesSize> rules{};
+   Clock::time_point heard;
+ };
+ std::array<uint8_t, kCustomDataSize> g_custom{};
++// Winner stays: the number of the last match this console fought in (one
++// more than the highest heard when it ended), and the title's party rules.
++uint32_t g_last_match = 0;
++std::array<uint8_t, kPartyRulesSize> g_rules{};
+ std::map<uint64_t, Member> g_members;  // by XUID
+ uint64_t g_party_signature = 0;        // what the title was last told about
+ Clock::time_point g_last_member_announce;
+@@ -169,6 +176,12 @@ Clock::time_point g_last_invite;
+ Clock::time_point g_host_left;  // when the hosted session last ended
+ bool g_left_lobby = false;      // ...from its lobby, not from a match
+ std::map<uint64_t, Clock::time_point> g_last_named;  // by XUID
++// A host that lost: its next lobby (the game's only way out of the results)
++// neither invites nor takes invites; it leaves it to queue. The match's
++// session ends after the match is reported, so this lasts until that lobby
++// ends.
++enum class StepDown { kNo, kBeforeLobby, kInLobby };
++StepDown g_step_down = StepDown::kNo;
+ 
+ #if REX_PLATFORM_WIN32
+ using NativeSocket = SOCKET;
+@@ -287,17 +300,21 @@ bool Invitable(const Member& member) {
+   return PresenceIn(REXCVAR_GET(lan_invite_presence), member.presence);
+ }
+ 
+-// The next challenger: the invitable member named longest ago (never first,
+-// then by XUID); 0 if none. g_mutex held.
++// The next challenger: the invitable member who fought longest ago (the party
++// keeps the count, so it survives a change of host), then the one this
++// console named longest ago (never first), then by XUID; 0 if none. g_mutex
++// held.
+ uint64_t PickChallenger() {
+   uint64_t best = 0;
++  uint32_t best_match = UINT32_MAX;
+   Clock::time_point best_named = Clock::time_point::max();
+   for (const auto& [xuid, member] : g_members) {
+     if (!Invitable(member)) continue;
+     const auto it = g_last_named.find(xuid);
+     const Clock::time_point named = it != g_last_named.end() ? it->second : Clock::time_point{};
+-    if (named < best_named) {
++    if (member.last_match < best_match || (member.last_match == best_match && named < best_named)) {
+       best = xuid;
++      best_match = member.last_match;
+       best_named = named;
+     }
+   }
+@@ -321,6 +338,8 @@ std::vector<uint8_t> MemberPacket() {
+     out.insert(out.end(), kInfoSize, 0);
+   }
+   Put32(out, OwnPresence());
++  Put32(out, g_last_match);
++  out.insert(out.end(), g_rules.begin(), g_rules.end());
+   return out;
+ }
+ 
+@@ -383,7 +402,8 @@ void ReceiveMember(Reader& in) {
+   uint8_t hosting = 0;
+   if (!in.U64(&xuid) || !in.Bytes(m.gamertag.data(), kGamertagSize) ||
+       !in.Bytes(m.custom.data(), kCustomDataSize) || !in.U8(&hosting) ||
+-      !in.Bytes(m.session.data(), kInfoSize) || !in.U32(&m.presence)) {
++      !in.Bytes(m.session.data(), kInfoSize) || !in.U32(&m.presence) ||
++      !in.U32(&m.last_match) || !in.Bytes(m.rules.data(), kPartyRulesSize)) {
+     return;
+   }
+   if (xuid == system_link::PlayerXuid()) return;  // our own
+@@ -437,10 +457,11 @@ void ReceiveInvite(Reader& in) {
+       return;  // full: the title would find no room
+     }
+     const bool first = g_invite_heard.emplace(session, now).second;
+-    if (g_party_host || (g_hosted_object && g_hosted.public_slots > 0)) {
++    const bool stepping_down = g_step_down != StepDown::kNo;
++    if (g_party_host || (g_hosted_object && (g_hosted.public_slots > 0 || stepping_down))) {
+       if (first && system_link::Logging()) {
+         REXSYS_INFO("lan party: invite ignored (this console hosts a {})",
+-                    g_party_host ? "party" : "match");
++                    g_party_host ? "party" : stepping_down ? "lobby it is leaving" : "match");
+       }
+       return;
+     }
+@@ -707,6 +728,7 @@ void HostCreated(uint32_t session, const uint8_t* info, uint32_t flags, uint32_t
+   }
+   // The party host's new lobby (back from a match) invites the party again.
+   g_inviting = g_party_host && public_slots == 0;
++  if (g_step_down == StepDown::kBeforeLobby) g_step_down = StepDown::kInLobby;
+   g_challenger = 0;
+   g_last_invite = Clock::time_point{};
+   if (g_inviting && system_link::Logging()) {
+@@ -765,6 +787,7 @@ void HostDeleted(uint32_t session) {
+   SendToLan(HostedPacket(kGone));
+   g_hosted_object = 0;
+   g_inviting = false;
++  if (g_step_down == StepDown::kInLobby) g_step_down = StepDown::kNo;
+   g_host_left = Clock::now();
+   g_left_lobby = PresenceIn(REXCVAR_GET(lan_invite_presence), OwnPresence());
+   if (system_link::Logging()) {
+@@ -944,4 +967,58 @@ bool AcceptedInvite(uint8_t* info) {
+   return true;
+ }
+ 
++PartyRole PartyMatchOver(int local_side, int winner_side) {
++  std::lock_guard lock(g_mutex);
++  // A party match: this console hosted the party, or took a party invite to
++  // the session it is in.
++  const bool party = g_party_host || (g_invited_to && g_joined == g_invited_to);
++  if (!party) return PartyRole::kNone;
++  if (local_side != 0 && local_side != 1) return PartyRole::kWatch;
++  uint32_t highest = g_last_match;
++  for (const auto& [xuid, member] : g_members) highest = std::max(highest, member.last_match);
++  g_last_match = highest + 1;
++  PartyRole role;
++  if (local_side == 0) {
++    role = winner_side == 0 ? PartyRole::kHost : PartyRole::kStepDown;
++  } else {
++    role = winner_side == 1 ? PartyRole::kBecomeHost : PartyRole::kRejoin;
++  }
++  if (role == PartyRole::kStepDown) {
++    g_party_host = false;
++    g_inviting = false;
++    g_step_down = StepDown::kBeforeLobby;
++  } else if (role == PartyRole::kBecomeHost) {
++    // Its next lobby invites the party (HostCreated), whoever it came from.
++    g_party_host = true;
++    g_left_lobby = false;
++    g_inviting = false;
++  }
++  SendToLan(MemberPacket());
++  g_last_member_announce = Clock::now();
++  if (system_link::Logging()) {
++    static const char* const kNames[] = {"none", "keeps hosting", "steps down", "becomes the host",
++                                         "queues again", "watched"};
++    REXSYS_INFO("lan party: match {} over, side {} won; this console (side {}) {}", g_last_match,
++                winner_side + 1, local_side + 1, kNames[int(role)]);
++  }
++  return role;
++}
++
++void SetPartyRules(const uint8_t* rules) {
++  if (!rules) return;
++  std::lock_guard lock(g_mutex);
++  if (std::memcmp(g_rules.data(), rules, kPartyRulesSize) == 0) return;
++  std::memcpy(g_rules.data(), rules, kPartyRulesSize);
++  SendToLan(MemberPacket());
++  g_last_member_announce = Clock::now();
++}
++
++bool LastHostRules(uint8_t* rules) {
++  std::lock_guard lock(g_mutex);
++  const auto it = g_members.find(g_last_host);
++  if (!rules || it == g_members.end()) return false;
++  std::memcpy(rules, it->second.rules.data(), kPartyRulesSize);
++  return true;
++}
++
+ }  // namespace rex::system::lan_sessions

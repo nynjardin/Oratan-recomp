@@ -47,6 +47,22 @@ inline constexpr uint32_t kPlayerActions = 0x82AFF1E0;
 // OnlineInput: a second source of command words that replaces the players'
 // when active (sub_8213D830/890/8E0); probably Xbox Live versus.
 inline constexpr uint32_t kOnlineInput = 0x829BF3A0;
+// be<int32_t>: the play mode; 2, 3 and 10 are online (sub_8214F150). 3 in an
+// Xbox LIVE Party Lobby match, from the Player Match menu on.
+inline constexpr uint32_t kPlayMode = 0x829C7024;
+// be<uint32_t>: the menu screen shown (menu_screen); the next word is it + 1.
+// Dialogs don't change it. Found by comparing captures, 2026-10-31.
+inline constexpr uint32_t kMenuScreen = 0x829C7D74;
+// be<uint32_t>: the Player Match menu's cursor (0 Quick Match, 1 Custom Match,
+// 2 Xbox LIVE Party Lobby).
+inline constexpr uint32_t kPlayerMatchCursor = 0x829C93A8;
+// PartyRules: the Party Lobby settings screen's values, kept in the lobby.
+inline constexpr uint32_t kPartyRules = 0x829C9020;
+// be<uint32_t>: the online results menu's cursor. An opponent's menu: 0 Fight
+// again ... 4 Return to Xbox LIVE VS. Play menu; the host's opens on Return
+// to lobby.
+inline constexpr uint32_t kResultsCursor = 0x82B038F8;
+inline constexpr uint32_t kResultsReturnToMenu = 4;
 // CommandCapture: when `active` is set, sub_822A71B0 only stores side 0's
 // command word here and builds no robot commands (meaning not yet known).
 inline constexpr uint32_t kCommandCapture = 0x839C28AC;
@@ -131,6 +147,28 @@ enum class Module : uint8_t {
   kCustomize = 5,  // Customize
   kMTest = 6,      // removed test menu
 };
+
+// Values at kMenuScreen.
+namespace menu_screen {
+inline constexpr uint32_t kMultiplayer = 8;    // Ranked match / Player match / System Link
+inline constexpr uint32_t kSelectVr = 22;      // robot select (entering Player match)
+inline constexpr uint32_t kPlayerMatch = 23;   // Quick / Custom / Party Lobby
+inline constexpr uint32_t kPartyRules = 24;    // Party Lobby settings (Back from the lobby too)
+inline constexpr uint32_t kLobby = 25;         // a Player Match lobby, host or guest
+inline constexpr uint32_t kOnlineMatch = 27;   // the match and its results (26 just before)
+inline constexpr uint32_t kBackToLobby = 28;   // the host's way from the results to its lobby
+}  // namespace menu_screen
+
+// ControllerState::held bits (seen with the keyboard, 2026-10-31).
+namespace pad {
+inline constexpr uint32_t kB = 0x0002;
+inline constexpr uint32_t kA = 0x0004;
+inline constexpr uint32_t kStart = 0x0200;
+inline constexpr uint32_t kUp = 0x1000;
+inline constexpr uint32_t kRight = 0x2000;
+inline constexpr uint32_t kDown = 0x4000;
+inline constexpr uint32_t kLeft = 0x8000;
+}  // namespace pad
 
 // Game::camera_view: whose view a frame is drawn from.
 enum class CameraView : uint8_t {
@@ -509,7 +547,12 @@ struct Game {
   be<uint16_t> scene_step;  // +0x242
   uint8_t unk_0244[0x264 - 0x244];
   LeverInput levers[2];  // +0x264, per side (sub_822A7070)
-  uint8_t unk_02A4[0x6148 - 0x2A4];
+  uint8_t unk_02A4[0x2E4 - 0x2A4];
+  // Rounds won in this match per side (sub_821C3A60, from kRoundResultOffset;
+  // a draw counts for both). The match is over when one exceeds the byte at
+  // kRoundsToWinOffset (sub_821C2EB8).
+  be<int32_t> rounds_won[2];  // +0x2E4
+  uint8_t unk_02EC[0x6148 - 0x2EC];
   // This tick's command word per side (sub_822A71B0), without command::kStart.
   be<uint16_t> robot_commands[2];  // +0x6148
   // Not yet typed: game+0x614C (24908) is 1 in Arcade and Score Attack
@@ -547,6 +590,29 @@ static_assert(offsetof(Game, robots) == 0x6150);
 static_assert(offsetof(Game, robots) + offsetof(Robot, cpu_controlled) == 25021);
 static_assert(offsetof(Game, robots) + sizeof(Robot) + offsetof(Robot, cpu_controlled) == 29517);
 static_assert(offsetof(Game, camera_view) == 53125);
+static_assert(offsetof(Game, rounds_won) == 740);
+
+// Match bytes that the current layout puts inside robots[0]'s head (the
+// fighter record proper starts at robot +0x6C), read by offset until Robot is
+// split. Seen in a Party Lobby match (2026-10-31), the same on host, opponent
+// and observer.
+// s8: rounds to win minus one (0 for a one-round match).
+inline constexpr uint32_t kRoundsToWinOffset = 0x6153;
+// u8: the last round's result for side 1 (round_result), set by sub_821C32C8
+// as the step goes to battle_step::kDecided; 0xFF while a round is undecided.
+inline constexpr uint32_t kRoundResultOffset = 0x6157;
+
+// Values at kRoundResultOffset, from side 1's point of view.
+namespace round_result {
+inline constexpr uint8_t kWinKo = 0;
+inline constexpr uint8_t kWinTime = 1;      // more health left (as a share of the maximum)
+inline constexpr uint8_t kWinPerfect = 2;
+inline constexpr uint8_t kLoseKo = 3;
+inline constexpr uint8_t kLoseTime = 4;
+inline constexpr uint8_t kLosePerfect = 5;  // side 2 won without losing health
+inline constexpr uint8_t kDraw = 6;         // double KO, or the same health share at time up
+inline constexpr uint8_t kUndecided = 0xFF;
+}  // namespace round_result
 
 // One side's input record (kSideInputs). 316 bytes.
 struct SideInput {
@@ -579,13 +645,19 @@ struct ControllerState {
   be<uint32_t> previous;  // +8: `held` at the previous read
   be<uint32_t> pressed;   // +12: held and not previous
   be<uint32_t> released;  // +16: previous and not held
-  uint8_t unk_14[28 - 20];
+  // +20: `pressed`, then again every few ticks while held, for the buttons
+  // that repeat (a mask at +240 of the read's settings: the directions). Menu
+  // cursors move on these.
+  be<uint32_t> repeated;
+  be<uint16_t> repeat_ticks;  // +24: ticks held, for the repeat
+  uint8_t unk_1A[28 - 26];
   be<uint32_t> packet_number;  // +28: the last XInput packet number processed
   uint8_t unk_20[60 - 32];
 };
 static_assert(sizeof(ControllerState) == 60);
 static_assert(offsetof(ControllerState, held) == 4);
 static_assert(offsetof(ControllerState, pressed) == 12);
+static_assert(offsetof(ControllerState, repeated) == 20);
 static_assert(offsetof(ControllerState, packet_number) == 28);
 
 // One player's input actions (kPlayerActions). 2152 bytes; only the action
@@ -605,7 +677,11 @@ static_assert(offsetof(PlayerActions, action_bits) == 32);
 struct OnlineInput {
   uint8_t unk_00[76];
   uint8_t active;  // +76
-  uint8_t unk_4D[88 - 77];
+  uint8_t unk_4D[80 - 77];
+  // This console's side in an online match (sub_8213D950): 0 = side 1 (the
+  // session host), 1 = side 2, 2 or more = an observer.
+  be<int32_t> local_side;  // +80
+  uint8_t unk_54[88 - 84];
   uint8_t ready;   // +88
   uint8_t unk_59[100 - 89];
   be<uint16_t> commands[2];  // +100: per side
@@ -613,9 +689,24 @@ struct OnlineInput {
   be<int32_t> state;  // +128: used only when not negative
 };
 static_assert(offsetof(OnlineInput, active) == 76);
+static_assert(offsetof(OnlineInput, local_side) == 80);
 static_assert(offsetof(OnlineInput, ready) == 88);
 static_assert(offsetof(OnlineInput, commands) == 100);
 static_assert(offsetof(OnlineInput, state) == 128);
+
+// kPartyRules: the Party Lobby settings. Opened fresh, the screen shows 80 s,
+// 2 rounds, 0 observers, cursor on OK.
+struct PartyRules {
+  be<uint32_t> help;  // the help line shown: 0 on OK, 3 time, 4 rounds, 6 observers
+  uint8_t unk_04[4];
+  be<uint32_t> time_limit;   // +8: an index (2 = 80 s, 1 = 70 s)
+  be<uint32_t> round_count;  // +12: rounds minus one
+  uint8_t unk_10[4];
+  be<uint32_t> observers;    // +20: 0-6
+};
+static_assert(offsetof(PartyRules, time_limit) == 8);
+static_assert(offsetof(PartyRules, round_count) == 12);
+static_assert(offsetof(PartyRules, observers) == 20);
 
 // kCommandCapture.
 struct CommandCapture {
@@ -692,6 +783,16 @@ inline bool IsBattleModule(Module module) {
 inline bool IsFightInProgress(const Game& g, Module module) {
   return IsBattleModule(module) && g.scene == scene_id::kBattle &&
          g.scene_step < battle_step::kContinue;
+}
+
+// The match's winner: 0 = side 1, 1 = side 2, -1 while the match goes on.
+// A final round drawn at match point puts both over; sub_821C2EB8 then counts
+// it as side 1's win, and so does this.
+inline int MatchWinner(const Game& g) {
+  const int8_t limit = int8_t(reinterpret_cast<const uint8_t*>(&g)[kRoundsToWinOffset]);
+  if (g.rounds_won[0] > limit) return 0;
+  if (g.rounds_won[1] > limit) return 1;
+  return -1;
 }
 
 inline SideInput* GetSideInputs(uint8_t* base) { return GuestPtr<SideInput>(base, kSideInputs); }

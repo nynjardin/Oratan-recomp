@@ -30,6 +30,7 @@ set(ORATAN_SOURCES
     src/tick_hooks.cpp
     src/system_link.cpp
     src/netplay.cpp
+    src/party_rotation.cpp
     src/decomp/decomp.cpp
     src/decomp/game_flow.cpp
     src/decomp/menu.cpp

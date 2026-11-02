@@ -40,4 +40,13 @@ void OnControllerRead(uint8_t* base);
 void OnTickEnd(uint8_t* base);
 }  // namespace netplay
 
+namespace party_rotation {
+// After each Update: notices a LAN party match's end and walks the menus
+// for what comes next (party_rotation.cpp).
+void OnTickEnd(uint8_t* base);
+// After the game read the controllers (after netplay and replays): the
+// button being pressed, if any.
+void OnControllerRead(uint8_t* base);
+}  // namespace party_rotation
+
 }  // namespace oratan

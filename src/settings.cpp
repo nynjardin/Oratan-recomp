@@ -39,6 +39,7 @@ constexpr Managed kManaged[] = {
     {"netplay_port", false}, {"netplay_address", true}, {"netplay_delay", false},
     {"netplay_pad", false},
     {"system_link", false},      {"player_name", true},       {"lan_live", false},
+    {"party_rotation", true},
 };
 
 std::string KeyOf(const std::string& line) {

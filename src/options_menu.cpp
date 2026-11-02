@@ -277,6 +277,20 @@ void OptionsDialog::OnDraw(ImGuiIO& io) {
     Save();
   }
   ImGui::EndDisabled();
+  ImGui::BeginDisabled(!lan_live);
+  static constexpr const char* kRotations[] = {"winner", "host", "off"};
+  static constexpr const char* kRotationNames[] = {"Winner stays", "Host always fights",
+                                                   "Off (leave the results by hand)"};
+  const std::string rotation = rex::cvar::GetFlagByName("party_rotation");
+  int rotation_index = 0;
+  for (int i = 0; i < 3; ++i) {
+    if (rotation == kRotations[i]) rotation_index = i;
+  }
+  if (ImGui::Combo("After a Party Lobby match", &rotation_index, kRotationNames, 3)) {
+    rex::cvar::SetFlagByName("party_rotation", kRotations[rotation_index]);
+    Save();
+  }
+  ImGui::EndDisabled();
   ImGui::TextDisabled("Multiplayer > System Link on each PC: the first player");
   ImGui::TextDisabled("waits, the next one joins. Same game version everywhere.");
   ImGui::TextDisabled("Xbox LIVE modes: Player Match (Quick or Custom Match)");
